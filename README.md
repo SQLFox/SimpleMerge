@@ -79,10 +79,10 @@ exec sp_SimpleMerge
   uses a CTE to limit the effect of the `MERGE` on the target
   * use `'<expression>'` as you would in a where clause (e.g. `isDeleted = 0`)
 * ### @output
-  dumps `MERGE` output to an audit table; must be a three-part name (`database.schema.table`) unless it is a temp table; 
+  dumps `MERGE` output to an audit table; must be a three-part name (`database.schema.table`) unless it is a temp table 
   * leave `NULL` to suppress output clause
 * ### @threshold
-  only executes `MERGE` if rowcounts are within acceptable variance. will be ignored if **@target** has no rows.
-  * use `'debug'` to print rowcounts and show constructed `MERGE` statement and creation script for output table
+  only executes `MERGE` if percentage of rows changed is within acceptable variance; will be ignored if **@target** has no rows.
   * use `NULL` to ignore variance
-
+* ### @debug
+  shows constructed `MERGE` statement and creation script for output table
