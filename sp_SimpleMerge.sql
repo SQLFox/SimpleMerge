@@ -1,6 +1,5 @@
 USE [master]
 GO
-/****** Object:  StoredProcedure [dbo].[sp_SimpleMerge]    Script Date: 2/21/2018 10:51:36 AM ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -17,6 +16,7 @@ GO
 --					* any other value omits the "when not matched by source" clause
 --				@targetFilter uses a CTE to limit the effect of the merge on the target
 --					* use '<expression>' as you would in a where clause (e.g. isDeleted = 0)
+--				@badKey uses CTEs for both target and source to add uniqueness to the key
 --				@output dumps merge output to an audit table; leave NULL to suppress output clause
 --				@threshold only executes merge if percentage of rows changed is within acceptable
 --						variance. will be ignored if @target has no rows.
@@ -49,13 +49,18 @@ GO
 --					preserve XML special characters.
 --				2018-02-21 - SM - Added dedicated @debug parameter. Replaced rowcount threshold
 --					with actual percentage of rows modified by merge.
+--				2018-03-09 - SM - Added handling for nullable key columns; Added more useful error
+--					when SHOWPLAN breaks dm_exec_describe_first_result_set
+--				2018-03-11 - SM - Added @badKey parameter; Added parsename() to @joinColumns
+--					handling
 -- /*==============================================================================================
-alter proc [dbo].[sp_SimpleMerge] (
+ALTER proc [dbo].[sp_SimpleMerge] (
 	@target varchar(256)
 	,@source varchar(256)
 	,@joinColumns varchar(max)
 	,@delete varchar(max) = 'YES'
 	,@targetFilter varchar(max) = null
+	,@badKey bit = 0
 	,@output varchar(256) = null
 	,@threshold varchar(6) = null
 	,@debug bit = 0
@@ -63,13 +68,15 @@ alter proc [dbo].[sp_SimpleMerge] (
 --*/
 set nocount on;
 /*
-declare @threshold varchar(6) = 'debug'
-declare @target varchar(256) = 'Imports.ad.Groups'
-declare @source varchar(256) = 'Imports.ad.Groups'
-declare @joinColumns varchar(max) = 'username,group'
+declare @threshold varchar(6) = '15%'
+declare @target varchar(256) = 'Exports.payroll.Punch'
+declare @source varchar(256) = 'Exports.payroll.Punch'
+declare @joinColumns varchar(max) = 'Employee,Date,Department,Job,PayCategory,Start'
 declare @delete varchar(max) = 'YES'
-declare @targetFilter varchar(max) = '[source] = ''eFinance'''
+declare @targetFilter varchar(max) = '[Date] >= ''2017-12-01'''
+declare @badKey bit = 1
 declare @output varchar(256) = null
+declare @debug bit = 1
 if object_id('tempdb..#columnList') is not null drop table #columnList;
 --*/
 /* ================================================================================================
@@ -142,7 +149,7 @@ if @threshold is not null or @debug = 1 begin
 		;
 	end
 /* ================================================================================================
-build merge statement
+build merge components
 ================================================================================================ */
 		create table #columnList (
 			name sysname null
@@ -150,6 +157,7 @@ build merge statement
 			,targetId int null
 			,joinCol int null
 			,system_type_name varchar(128) null
+			,is_nullable bit null
 			);
 		set @sql = N'
 		WITH E1(N) AS (		/*splitting code copied from Jeff Moden''s [DelimitedSplit8K]*/
@@ -168,6 +176,7 @@ build merge statement
 			,targetId = tc.column_ordinal
 			,joinCol = s.ItemNumber
 			,tc.system_type_name
+			,tc.is_nullable
 			from (
 				select
 					name
@@ -178,16 +187,91 @@ build merge statement
 			full outer join sys.dm_exec_describe_first_result_set(''select * from ' + @target + ''',null,0) tc
 				on sc.name = tc.name
 			full outer join split s
-				on ltrim(s.Item) = sc.name
-				or ltrim(s.Item) = tc.name
+				on parsename(ltrim(rtrim(s.Item)),1) = sc.name
+				or parsename(ltrim(rtrim(s.Item)),1) = tc.name
 ';		insert into #columnList
 			exec sp_executesql @sql, N'@pString varchar(8000)', @pString = @joinColumns;
+		if exists (select 1 from #columnList where [name] is null and targetId = 0)
+			throw 50000, 'sp_describe_first_result_set cannot be invoked when SET STATISTICS XML or SET STATISTICS PROFILE is on.', 1;
 		if exists (select 1 from #columnList where joinCol is not null and sourceId is null)
 			throw 50000, 'Specified join column missing from source.', 1;
 		if exists (select 1 from #columnList where joinCol is not null and targetId is null)
 			throw 50000, 'Specified join column missing from target.', 1;
 		if exists (select 1 from #columnList where sourceId is not null and targetId is null)
 			throw 50000, 'Specified source column missing from target.', 1;
+/* ================================================================================================
+prefix
+================================================================================================ */
+declare @mergePrefix varchar(max) = case
+	when @targetFilter is not null or @badKey = 1 then 
+		'with [target] as (
+	select *' + case
+			when @badKey = 1 then '
+		,_SimpleMerge_rn = row_number() over(
+			partition by 
+				' + stuff((
+				select '
+				,' + quotename([name])
+					from #columnList
+						where joinCol is not null
+						order by joinCol
+						for xml path(''), type
+						).value('.','varchar(max)'),1,7,'') + '
+			order by %%physloc%%)'
+			else '' end + '
+		from ' + @target + case
+			when @targetFilter is not null then '
+		where ' + @targetFilter
+			else '' end + '
+	)' + case
+			when @badKey = 1 then ', [source] as (
+	select *
+		,_SimpleMerge_rn = row_number() over(
+			partition by 
+				' + stuff((
+				select '
+				,' + quotename([name])
+					from #columnList
+						where joinCol is not null
+						order by joinCol
+						for xml path(''), type
+						).value('.','varchar(max)'),1,7,'') + '
+			order by %%physloc%%)
+		from ' + @source + '
+	)'
+			else '' end + '
+merge into [target] t
+	using ' + case
+			when @badKey = 1 then '[source]'
+			else @source end + ' s'
+	else
+		'merge into ' + @target + ' t
+	using ' + @source + ' s'
+	end
+/* ================================================================================================
+join condition
+================================================================================================ */
+declare @mergeJoin varchar(max) = '
+		on ' + stuff((
+			select
+				'
+		and (t.' + quotename(name) + ' = s.' + quotename(name) + case 
+					when is_nullable = 0 then ')' else '
+			or (t.' + quotename(name) + ' is null
+				and s.' + quotename(name) + ' is null
+				)
+			)'		end
+				from #columnList
+				where joinCol is not null
+				order by joinCol
+				for xml path(''), type
+			).value('.','varchar(max)'),1,8,'')
+	+ case when @badKey = 1 then '
+		and t._SimpleMerge_rn = s._SimpleMerge_rn'
+		else '' end
+/* ================================================================================================
+when matched and not exists
+================================================================================================ */
 		if exists (select 1 from #columnList where joinCol is null and sourceId is not null)
 			set @matchedSQL = '
 	when matched and not exists (
@@ -223,20 +307,11 @@ build merge statement
 					for xml path(''), type
 				).value('.','varchar(max)'),1,6,'')
 		;
-		if @targetFilter is not null
-			set @sql = 'with [target] as (select * from ' + @target + ' where ' + @targetFilter + ')
-merge into [target] t
-	';	else set @sql = 'merge into ' + @target + ' t
-	';	set @sql += 'using ' + @source + ' s
-		on ' + stuff((
-			select
-				'
-		and t.' + quotename(name) + ' = s.' + quotename(name)
-				from #columnList
-				where joinCol is not null
-				order by joinCol
-				for xml path(''), type
-			).value('.','varchar(max)'),1,8,'')
+/* ================================================================================================
+assemble merge
+================================================================================================ */
+set @sql = @mergePrefix 
+	+ @mergeJoin
 	+ @matchedSQL + '
 	when not matched by target
 		then insert (
@@ -417,4 +492,3 @@ update extended property "lastUpdate"
 				end
 
 end
-
